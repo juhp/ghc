@@ -708,7 +708,7 @@ mkGivenErrorReporter implic ctxt cts
                              Nothing ty1 ty2
 
        ; traceTc "mkGivenErrorReporter" (ppr ct)
-       ; maybeReportError ctxt err }
+       ; reportWarning NoReason err }
   where
     (ct : _ )  = cts    -- Never empty
     (ty1, ty2) = getEqPredTys (ctPred ct)
