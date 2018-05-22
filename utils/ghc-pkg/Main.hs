@@ -1077,6 +1077,10 @@ initPackageDB filename verbosity _flags = do
       packageDbLock = GhcPkg.DbOpenReadWrite lock,
       packages = []
     }
+    -- We can get away with passing an empty stack here, because the new DB is
+    -- going to be initially empty, so no dependencies are going to be actually
+    -- looked up.
+    []
 
 -- -----------------------------------------------------------------------------
 -- Registering
@@ -1144,7 +1148,7 @@ registerPackage input verbosity my_flags multi_instance
                  -- Only remove things that were instantiated the same way!
                  instantiatedWith p == instantiatedWith pkg ]
   --
-  changeDB verbosity (removes ++ [AddPackage pkg]) db_to_operate_on
+  changeDB verbosity (removes ++ [AddPackage pkg]) db_to_operate_on db_stack
 
 parsePackageInfo
         :: String
@@ -1169,12 +1173,12 @@ data DBOp = RemovePackage InstalledPackageInfo
           | AddPackage    InstalledPackageInfo
           | ModifyPackage InstalledPackageInfo
 
-changeDB :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> IO ()
-changeDB verbosity cmds db = do
+changeDB :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+changeDB verbosity cmds db db_stack = do
   let db' = updateInternalDB db cmds
   db'' <- adjustOldFileStylePackageDB db'
   createDirectoryIfMissing True (location db'')
-  changeDBDir verbosity cmds db''
+  changeDBDir verbosity cmds db'' db_stack
 
 updateInternalDB :: PackageDB 'GhcPkg.DbReadWrite
                  -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite
@@ -1187,10 +1191,10 @@ updateInternalDB db cmds = db{ packages = foldl do_cmd (packages db) cmds }
     do_cmd (do_cmd pkgs (RemovePackage p)) (AddPackage p)
 
 
-changeDBDir :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> IO ()
-changeDBDir verbosity cmds db = do
+changeDBDir :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+changeDBDir verbosity cmds db db_stack = do
   mapM_ do_cmd cmds
-  updateDBCache verbosity db
+  updateDBCache verbosity db db_stack
  where
   do_cmd (RemovePackage p) = do
     let file = location db </> display (installedUnitId p) <.> "conf"
@@ -1203,16 +1207,19 @@ changeDBDir verbosity cmds db = do
   do_cmd (ModifyPackage p) =
     do_cmd (AddPackage p)
 
-updateDBCache :: Verbosity -> PackageDB 'GhcPkg.DbReadWrite -> IO ()
-updateDBCache verbosity db = do
+updateDBCache :: Verbosity -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+updateDBCache verbosity db db_stack = do
   let filename = location db </> cachefilename
 
       pkgsCabalFormat :: [InstalledPackageInfo]
       pkgsCabalFormat = packages db
 
+      allPkgsCabalFormat :: [InstalledPackageInfo]
+      allPkgsCabalFormat = allPackagesInStack db_stack
+
       pkgsGhcCacheFormat :: [PackageCacheFormat]
       pkgsGhcCacheFormat
-        = map (recomputeValidAbiDeps pkgsCabalFormat) -- Note [Recompute abi-depends]
+        = map (recomputeValidAbiDeps allPkgsCabalFormat) -- Note [Recompute abi-depends]
         $ map convertPackageInfoToCacheFormat
           pkgsCabalFormat
 
@@ -1421,14 +1428,14 @@ modifyPackage fn pkgarg verbosity my_flags force = do
       dieOrForceAll force ("unregistering would break the following packages: "
               ++ unwords (map displayQualPkgId newly_broken))
 
-  changeDB verbosity cmds db
+  changeDB verbosity cmds db db_stack
 
 recache :: Verbosity -> [Flag] -> IO ()
 recache verbosity my_flags = do
   (_db_stack, GhcPkg.DbOpenReadWrite db_to_operate_on, _flag_dbs) <-
     getPkgDatabases verbosity (GhcPkg.DbOpenReadWrite TopOne)
       True{-use user-} False{-no cache-} False{-expand vars-} my_flags
-  changeDB verbosity [] db_to_operate_on
+  changeDB verbosity [] db_to_operate_on _db_stack
 
 -- -----------------------------------------------------------------------------
 -- Listing packages
