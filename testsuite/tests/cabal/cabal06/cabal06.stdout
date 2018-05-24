@@ -1,7 +1,7 @@
-ignoring (possibly broken) abi-depends field for packages
-ignoring (possibly broken) abi-depends field for packages
-ignoring (possibly broken) abi-depends field for packages
-ignoring (possibly broken) abi-depends field for packages
+overriding broken abi-depends field for packages: 
+    q
+overriding broken abi-depends field for packages: 
+    q
 Does the first instance of q depend on p-1.0?
 1
 Does the second instance of q depend on p-1.0?

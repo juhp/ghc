@@ -1,4 +1,5 @@
-ignoring (possibly broken) abi-depends field for packages
+overriding broken abi-depends field for packages: 
+    shadowdep
 should SUCCEED
 should SUCCEED
 should SUCCEED
