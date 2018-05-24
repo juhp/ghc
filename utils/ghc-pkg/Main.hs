@@ -577,6 +577,15 @@ data DbModifySelector = TopOne | ContainsPkg PackageArg
 allPackagesInStack :: PackageDBStack -> [InstalledPackageInfo]
 allPackagesInStack = concatMap packages
 
+-- | Retain only the part of the stack up to and including the given package
+-- DB (where the global package DB is the bottom of the stack). The resulting
+-- package DB stack contains exactly the packages that packages from the
+-- specified package DB can depend on, since dependencies can only extend
+-- down the stack, not up (e.g. global packages cannot depend on user
+-- packages).
+stackUpTo :: FilePath -> PackageDBStack -> PackageDBStack
+stackUpTo to_modify = dropWhile ((/= to_modify) . location)
+
 getPkgDatabases :: Verbosity
                 -> GhcPkg.DbOpenMode mode DbModifySelector
                 -> Bool    -- use the user db
@@ -1130,7 +1139,7 @@ registerPackage input verbosity my_flags multi_instance
   let top_dir = takeDirectory (location (last db_stack))
       pkg_expanded = mungePackagePaths top_dir pkgroot pkg
 
-  let truncated_stack = dropWhile ((/= to_modify).location) db_stack
+  let truncated_stack = stackUpTo to_modify db_stack
   -- truncate the stack for validation, because we don't allow
   -- packages lower in the stack to refer to those higher up.
   validatePackageConfig pkg_expanded verbosity truncated_stack
@@ -1173,7 +1182,11 @@ data DBOp = RemovePackage InstalledPackageInfo
           | AddPackage    InstalledPackageInfo
           | ModifyPackage InstalledPackageInfo
 
-changeDB :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+changeDB :: Verbosity
+         -> [DBOp]
+         -> PackageDB 'GhcPkg.DbReadWrite
+         -> PackageDBStack
+         -> IO ()
 changeDB verbosity cmds db db_stack = do
   let db' = updateInternalDB db cmds
   db'' <- adjustOldFileStylePackageDB db'
@@ -1191,7 +1204,11 @@ updateInternalDB db cmds = db{ packages = foldl do_cmd (packages db) cmds }
     do_cmd (do_cmd pkgs (RemovePackage p)) (AddPackage p)
 
 
-changeDBDir :: Verbosity -> [DBOp] -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+changeDBDir :: Verbosity
+            -> [DBOp]
+            -> PackageDB 'GhcPkg.DbReadWrite
+            -> PackageDBStack
+            -> IO ()
 changeDBDir verbosity cmds db db_stack = do
   mapM_ do_cmd cmds
   updateDBCache verbosity db db_stack
@@ -1207,19 +1224,25 @@ changeDBDir verbosity cmds db db_stack = do
   do_cmd (ModifyPackage p) =
     do_cmd (AddPackage p)
 
-updateDBCache :: Verbosity -> PackageDB 'GhcPkg.DbReadWrite -> PackageDBStack -> IO ()
+updateDBCache :: Verbosity
+              -> PackageDB 'GhcPkg.DbReadWrite
+              -> PackageDBStack
+              -> IO ()
 updateDBCache verbosity db db_stack = do
   let filename = location db </> cachefilename
+      db_stack_below = stackUpTo (location db) db_stack
 
       pkgsCabalFormat :: [InstalledPackageInfo]
       pkgsCabalFormat = packages db
 
-      allPkgsCabalFormat :: [InstalledPackageInfo]
-      allPkgsCabalFormat = allPackagesInStack db_stack
+      -- | All the packages we can legally depend on in this step.
+      dependablePkgsCabalFormat :: [InstalledPackageInfo]
+      dependablePkgsCabalFormat = allPackagesInStack db_stack_below
 
-      pkgsGhcCacheFormat :: [PackageCacheFormat]
+      pkgsGhcCacheFormat :: [(PackageCacheFormat, Bool)]
       pkgsGhcCacheFormat
-        = map (recomputeValidAbiDeps allPkgsCabalFormat) -- Note [Recompute abi-depends]
+        -- See Note [Recompute abi-depends]
+        = map (recomputeValidAbiDeps dependablePkgsCabalFormat)
         $ map convertPackageInfoToCacheFormat
           pkgsCabalFormat
 
@@ -1228,13 +1251,24 @@ updateDBCache verbosity db db_stack = do
 
   -- warn when we find any (possibly-)bogus abi-depends fields;
   -- Note [Recompute abi-depends]
-  when (any hasAnyAbiDepends pkgsCabalFormat) $
-      infoLn "ignoring (possibly broken) abi-depends field for packages"
+  let definitelyBrokenPackages =
+        nub . sort . map (unPackageName . GhcPkg.packageName . fst) . filter snd $ pkgsGhcCacheFormat
+  when (definitelyBrokenPackages /= []) $ do
+    infoLn "overriding broken abi-depends field for packages: "
+    forM_ definitelyBrokenPackages $ \pkg ->
+      infoLn $ "    " ++ pkg
+  when (verbosity > Normal) $ do
+    let possiblyBrokenPackages =
+          nub . sort . map (unPackageName . pkgName . packageId) . filter hasAnyAbiDepends $ pkgsCabalFormat
+    when (possiblyBrokenPackages /= []) $ do
+        infoLn "ignoring (possibly broken) abi-depends field for packages: "
+        forM_ possiblyBrokenPackages $ \pkg ->
+          infoLn $ "    " ++ pkg
 
   when (verbosity > Normal) $
       infoLn ("writing cache " ++ filename)
 
-  GhcPkg.writePackageDb filename pkgsGhcCacheFormat pkgsCabalFormat
+  GhcPkg.writePackageDb filename (map fst pkgsGhcCacheFormat) pkgsCabalFormat
     `catchIO` \e ->
       if isPermissionError e
       then die $ filename ++ ": you don't have permission to modify this file"
@@ -1280,16 +1314,25 @@ So, instead, we do two things here:
 
 See Trac #14381, and Cabal issue #4728.
 
+Additionally, because we are throwing away the original (declared) ABI deps, we
+return a boolean that indicates whether any abi-depends were actually
+overridden.
+
 -}
 
-recomputeValidAbiDeps :: [InstalledPackageInfo] -> PackageCacheFormat -> PackageCacheFormat
-recomputeValidAbiDeps db pkg = pkg { GhcPkg.abiDepends = catMaybes (newAbiDeps) }
+recomputeValidAbiDeps :: [InstalledPackageInfo]
+                      -> PackageCacheFormat
+                      -> (PackageCacheFormat, Bool)
+recomputeValidAbiDeps db pkg =
+  (pkg { GhcPkg.abiDepends = newAbiDeps }, abiDepsUpdated)
   where
-    newAbiDeps = flip map (GhcPkg.abiDepends pkg) $ \(k, _) ->
-      case filter (\d -> installedUnitId d == k) db of
-        []  -> Nothing
-        [x] -> Just (k, unAbiHash (abiHash x))
-        _   -> Nothing -- ???
+    newAbiDeps =
+      catMaybes . flip map (GhcPkg.abiDepends pkg) $ \(k, _) ->
+        case filter (\d -> installedUnitId d == k) db of
+          [x] -> Just (k, unAbiHash (abiHash x))
+          _   -> Nothing
+    abiDepsUpdated =
+      GhcPkg.abiDepends pkg /= newAbiDeps
 
 convertPackageInfoToCacheFormat :: InstalledPackageInfo -> PackageCacheFormat
 convertPackageInfoToCacheFormat pkg =
